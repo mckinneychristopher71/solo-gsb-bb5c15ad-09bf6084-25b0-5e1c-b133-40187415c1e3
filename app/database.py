@@ -108,6 +108,32 @@ CREATE TABLE IF NOT EXISTS roll_snapshots (
 );
 
 CREATE INDEX IF NOT EXISTS idx_snapshots_roll ON roll_snapshots (roll_no);
+
+-- 批次导入预检单：提交与 /batches 相同的数据，只生成持久化预检单而不写入批次。
+-- raw_frames_json 保留原始帧顺序（含批内重复）；state_fingerprint 为创建时胶卷
+-- 状态（合并后预期范围 + 实扫帧集合）的指纹，确认时在同一写事务内复核，
+-- 不一致则拒绝导入（409）。确认成功后 result_json 冻结首次导入结果，
+-- 同一预检单再次确认原样返回。
+CREATE TABLE IF NOT EXISTS import_prechecks (
+    id                    TEXT PRIMARY KEY,
+    roll_no               TEXT NOT NULL,
+    expected_start        INTEGER NOT NULL,
+    expected_end          INTEGER NOT NULL,
+    raw_frames_json       TEXT NOT NULL,
+    batch_id              TEXT,
+    state_fingerprint     TEXT NOT NULL,
+    current_expected_json TEXT NOT NULL,
+    added_frames_json     TEXT NOT NULL,
+    duplicates_json       TEXT NOT NULL,
+    post_expected_json    TEXT NOT NULL,
+    post_missing_json     TEXT NOT NULL,
+    confirmed_at          TEXT,
+    result_batch_id       TEXT,
+    result_json           TEXT,
+    created_at            TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_prechecks_roll ON import_prechecks (roll_no);
 """
 
 

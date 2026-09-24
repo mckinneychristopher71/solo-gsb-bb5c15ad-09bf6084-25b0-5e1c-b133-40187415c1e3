@@ -403,6 +403,249 @@ def submit_batch(conn: sqlite3.Connection, data: schemas.BatchIn) -> tuple[schem
     return result, 201
 
 
+# ---------- 批次导入预检 ----------
+
+class PrecheckNotFoundError(Exception):
+    def __init__(self, precheck_id: str):
+        self.precheck_id = precheck_id
+        super().__init__(f"预检单不存在: {precheck_id}")
+
+
+class PrecheckStaleError(Exception):
+    """确认时胶卷状态指纹与预检单创建时不一致，拒绝落库。"""
+
+    def __init__(self, precheck_id: str):
+        self.precheck_id = precheck_id
+        super().__init__(f"预检单对应的胶卷状态已变化: {precheck_id}")
+
+
+def _state_fingerprint(
+    roll_no: str,
+    expected: list[tuple[int, int]],
+    frames: set[int],
+) -> str:
+    """胶卷当前状态指纹：合并后的预期闭区间 + 去重排序实扫帧集合的 SHA-256。
+
+    预检单创建时固化一份；确认时在同一写事务内重算，两者一致才允许导入。
+    """
+    payload = json.dumps(
+        {
+            "roll_no": roll_no,
+            "expected": [[s, e] for s, e in expected],
+            "frames": sorted(frames),
+        },
+        separators=(",", ":"),
+        ensure_ascii=False,
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _precheck_out(r: sqlite3.Row) -> schemas.BatchPrecheckOut:
+    return schemas.BatchPrecheckOut(
+        precheck_id=r["id"],
+        roll_no=r["roll_no"],
+        batch_id=r["batch_id"],
+        expected_start=r["expected_start"],
+        expected_end=r["expected_end"],
+        raw_frames=json.loads(r["raw_frames_json"]),
+        added_frames=json.loads(r["added_frames_json"]),
+        duplicates=json.loads(r["duplicates_json"]),
+        current_expected_ranges=json.loads(r["current_expected_json"]),
+        post_import_expected_ranges=json.loads(r["post_expected_json"]),
+        post_import_missing_ranges=json.loads(r["post_missing_json"]),
+        state_fingerprint=r["state_fingerprint"],
+        confirmed=r["confirmed_at"] is not None,
+        created_at=r["created_at"],
+        confirmed_at=r["confirmed_at"],
+    )
+
+
+def create_precheck(
+    conn: sqlite3.Connection, data: schemas.BatchIn
+) -> schemas.BatchPrecheckOut:
+    """生成持久化预检单（不写批次、不改胶卷汇总）。
+
+    BEGIN IMMEDIATE 与并发写入串行化，预检内容与状态指纹对应同一读状态：
+    相对当前胶卷状态计算新增帧、重复帧（含批内重复）、导入后合并预期范围
+    与缺帧区间，并把原始帧顺序、原始请求与状态指纹一起持久化。
+    胶卷尚不存在（未导入过批次）时当前状态按空集合处理，同样允许预检。
+    """
+    precheck_id = uuid.uuid4().hex
+
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        expected = _expected_ranges(conn, data.roll_no)
+        existing_frames = _all_frames(conn, data.roll_no)
+        fingerprint = _state_fingerprint(data.roll_no, expected, existing_frames)
+
+        raw_frames = list(data.frames)  # 保留原始顺序与批内重复
+        frame_set = set(raw_frames)
+        within_dup = _within_batch_duplicates(raw_frames)
+        duplicates = sorted(within_dup | (frame_set & existing_frames))
+        added = sorted(frame_set - existing_frames)
+
+        post_expected = merge_intervals(
+            expected + [(data.expected_start, data.expected_end)]
+        )
+        post_missing = missing_intervals(
+            post_expected, existing_frames | frame_set
+        )
+
+        conn.execute(
+            """INSERT INTO import_prechecks
+                   (id, roll_no, expected_start, expected_end, raw_frames_json,
+                    batch_id, state_fingerprint, current_expected_json,
+                    added_frames_json, duplicates_json,
+                    post_expected_json, post_missing_json)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                precheck_id,
+                data.roll_no,
+                data.expected_start,
+                data.expected_end,
+                json.dumps(raw_frames),
+                data.batch_id,
+                fingerprint,
+                json.dumps([list(x) for x in expected]),
+                json.dumps(added),
+                json.dumps(duplicates),
+                json.dumps([list(x) for x in post_expected]),
+                json.dumps([list(x) for x in post_missing]),
+            ),
+        )
+        conn.execute("COMMIT")
+    except Exception:
+        conn.execute("ROLLBACK")
+        raise
+
+    r = conn.execute(
+        "SELECT * FROM import_prechecks WHERE id = ?", (precheck_id,)
+    ).fetchone()
+    assert r is not None
+    return _precheck_out(r)
+
+
+def get_precheck(
+    conn: sqlite3.Connection, precheck_id: str
+) -> schemas.BatchPrecheckOut | None:
+    r = conn.execute(
+        "SELECT * FROM import_prechecks WHERE id = ?", (precheck_id,)
+    ).fetchone()
+    return _precheck_out(r) if r is not None else None
+
+
+def confirm_precheck(
+    conn: sqlite3.Connection, precheck_id: str
+) -> tuple[schemas.BatchPrecheckConfirmOut, int]:
+    """确认预检单：复核状态指纹后执行与 POST /batches 相同的导入逻辑。
+
+    指纹复核与导入在同一 BEGIN IMMEDIATE 写事务内完成：
+
+    - 预检单不存在 → PrecheckNotFoundError（接口 404）；
+    - 当前胶卷状态指纹与创建时不同 → PrecheckStaleError（接口 409），不落库；
+    - 首次确认：按现有逻辑导入（内容已被并发导入则按幂等重复处理，200），
+      冻结导入结果后提交；显式 batch_id 被其他内容占用 → BatchIdConflictError（409）；
+    - 同一预检单再次确认：原样返回首次冻结的导入结果（200，confirmed=true）。
+    """
+    precheck_id = precheck_id.strip()
+
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        pc = conn.execute(
+            "SELECT * FROM import_prechecks WHERE id = ?", (precheck_id,)
+        ).fetchone()
+        if pc is None:
+            raise PrecheckNotFoundError(precheck_id)
+
+        # 已确认过：返回首次冻结的结果，不再导入
+        if pc["result_json"] is not None:
+            frozen = json.loads(pc["result_json"])
+            conn.execute("ROLLBACK")
+            out = schemas.BatchPrecheckConfirmOut(
+                **frozen["result"],
+                precheck_id=precheck_id,
+                confirmed=True,
+                import_status_code=frozen["status_code"],
+            )
+            return out, 200
+
+        # 同一写事务内复核创建时的胶卷状态指纹
+        expected = _expected_ranges(conn, pc["roll_no"])
+        existing_frames = _all_frames(conn, pc["roll_no"])
+        fingerprint = _state_fingerprint(pc["roll_no"], expected, existing_frames)
+        if fingerprint != pc["state_fingerprint"]:
+            raise PrecheckStaleError(precheck_id)
+
+        raw_frames = json.loads(pc["raw_frames_json"])
+        frames = sorted(set(raw_frames))
+        digest = content_hash(
+            pc["roll_no"], pc["expected_start"], pc["expected_end"], frames
+        )
+
+        # 与 submit_batch 相同的幂等判定与导入逻辑
+        existing = conn.execute(
+            "SELECT id FROM batches WHERE roll_no = ? AND content_hash = ?",
+            (pc["roll_no"], digest),
+        ).fetchone()
+        if existing is not None:
+            base = get_batch(conn, existing["id"])
+            assert base is not None
+            status_code = 200
+        else:
+            batch_id = pc["batch_id"] or f"auto-{uuid.uuid4().hex}"
+            batch_id, new_frames, duplicates = _import_batch_tx(
+                conn,
+                pc["roll_no"],
+                pc["expected_start"],
+                pc["expected_end"],
+                raw_frames,
+                batch_id,
+            )
+            st = _state_from_db(conn, pc["roll_no"])
+            base = schemas.BatchResult(
+                batch_id=batch_id,
+                roll_no=pc["roll_no"],
+                repeated=False,
+                added_frames=new_frames,
+                duplicates=duplicates,
+                merged_frames=sorted(st["frames"]),
+                expected_ranges=[list(x) for x in st["expected"]],
+                missing_ranges=[list(x) for x in st["missing"]],
+                out_of_range_frames=st["out_of_range"],
+            )
+            status_code = 201
+
+        now = _now_iso()
+        frozen = {"status_code": status_code, "result": base.model_dump()}
+        conn.execute(
+            """UPDATE import_prechecks
+                  SET confirmed_at = ?, result_batch_id = ?, result_json = ?
+                WHERE id = ?""",
+            (now, base.batch_id, json.dumps(frozen, ensure_ascii=False), precheck_id),
+        )
+        conn.execute("COMMIT")
+    except PrecheckNotFoundError:
+        conn.execute("ROLLBACK")
+        raise
+    except PrecheckStaleError:
+        conn.execute("ROLLBACK")
+        raise
+    except BatchIdConflictError:
+        conn.execute("ROLLBACK")
+        raise
+    except Exception:
+        conn.execute("ROLLBACK")
+        raise
+
+    out = schemas.BatchPrecheckConfirmOut(
+        **base.model_dump(),
+        precheck_id=precheck_id,
+        confirmed=False,
+        import_status_code=status_code,
+    )
+    return out, status_code
+
+
 # ---------- 批次撤销 ----------
 
 class BatchNotFoundError(Exception):

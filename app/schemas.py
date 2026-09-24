@@ -47,6 +47,58 @@ class BatchResult(BaseModel):
     created_at: str | None = None
 
 
+class BatchPrecheckOut(BaseModel):
+    """预检单：相对创建时胶卷状态的预演结果（此时尚未写入任何批次）。"""
+
+    precheck_id: str = Field(..., description="预检单 ID，凭此确认导入")
+    roll_no: str
+    batch_id: str | None = Field(
+        ..., description="预检提交时携带的客户端批次号；留空时确认后服务端自动生成"
+    )
+    expected_start: int = Field(..., description="本批预期帧号起始（含）")
+    expected_end: int = Field(..., description="本批预期帧号结束（含）")
+    raw_frames: list[int] = Field(
+        ..., description="提交的原始帧列表（含批内重复，保留提交时的原始顺序）"
+    )
+    added_frames: list[int] = Field(
+        ..., description="若此刻导入将新增的帧号（去重排序）"
+    )
+    duplicates: list[int] = Field(
+        ..., description="重复帧（批内重复 + 胶卷已有），只计一次"
+    )
+    current_expected_ranges: list[list[int]] = Field(
+        ..., description="创建预检单时胶卷已有的合并预期覆盖闭区间"
+    )
+    post_import_expected_ranges: list[list[int]] = Field(
+        ..., description="导入后胶卷的合并预期覆盖闭区间"
+    )
+    post_import_missing_ranges: list[list[int]] = Field(
+        ..., description="导入后预期范围内的连续缺帧区间"
+    )
+    state_fingerprint: str = Field(
+        ...,
+        description="创建时胶卷状态（预期范围 + 实扫帧集合）的 SHA-256 指纹，确认时复核",
+    )
+    confirmed: bool = Field(..., description="是否已确认导入")
+    created_at: str
+    confirmed_at: str | None = None
+
+
+class BatchPrecheckConfirmOut(BatchResult):
+    """确认预检单的结果：与 POST /batches 响应同构，另带预检单信息。
+
+    同一预检单再次确认原样返回首次结果（import_status_code 也与首次一致）。
+    """
+
+    precheck_id: str
+    confirmed: bool = Field(
+        ..., description="True=本次为重复确认，返回的是首次导入冻结的结果"
+    )
+    import_status_code: int = Field(
+        ..., description="首次导入对应的状态码：201 新建 / 200 内容重复"
+    )
+
+
 class QualityAlertThresholds(BaseModel):
     duplicate_rate: float = Field(
         ..., description="批内重复率告警阈值（达到即触发 HIGH_DUPLICATE_RATE）"
