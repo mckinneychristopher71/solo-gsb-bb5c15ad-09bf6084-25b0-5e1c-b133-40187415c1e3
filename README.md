@@ -17,6 +17,10 @@
 在一次只读事务中按原始顺序计算批内重复率、越界帧、最长连续扫到段、
 预期内最长缺口与连续段数，并给出按阈值触发的稳定告警代码，
 供档案员评估单个批次的采集质量（只读，不改动批次或胶卷汇总）。
+正式导入前还可生成**批次导入预检单**：提交与 `/batches` 相同的数据，
+返回相对当前胶卷状态的新增帧、重复帧、导入后预期范围与缺帧区间但不写入批次；
+预检单保留原始帧顺序与创建时胶卷状态指纹，确认时在同一 SQLite 写事务内复核
+指纹后再执行导入，状态已变则拒绝（`409`），同一预检单重复确认回放首次结果。
 
 技术栈：Python + FastAPI + SQLite（单文件库，零外部依赖）。
 
@@ -107,13 +111,113 @@ curl -X POST http://localhost:8000/batches \
 - 预期范围自动合并为 `[[1,14]]`，`missing_ranges` 随之基于合并范围重新计算
 - 帧 15 这种落在该胶卷**所有**预期范围之外的扫描帧，不计入缺帧，列入 `out_of_range_frames`
 
-### 2. 查询批次
+### 2. 批次导入预检与确认（两步提交）
+
+正式导入前，可以先用**与 `POST /batches` 完全相同的请求体**生成一张持久化
+**预检单**：服务按当前胶卷状态模拟一次导入并返回结论，但**不写入任何批次**，
+胶卷状态不发生任何变化。
+
+#### 2.1 创建预检单
+
+```bash
+curl -X POST http://localhost:8000/batch-previews \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "roll_no": "R-001",
+    "expected_start": 10,
+    "expected_end": 14,
+    "frames": [11, 12, 12, 13, 14],
+    "batch_id": "b-2026-002"
+  }'
+```
+
+响应 `201 Created`（沿用第 1 节已导入 `b-2026-001` 的胶卷：已扫
+`1,2,3,5,8,9,10,12`、预期 `[1,12]`）：
+
+```json
+{
+  "preview_id": "7c2b9f4d0a6e4f2a8d1c6b3e5f7a9012",
+  "roll_no": "R-001",
+  "batch_id": "b-2026-002",
+  "expected_start": 10,
+  "expected_end": 14,
+  "raw_frames": [11, 12, 12, 13, 14],
+  "added_frames": [11, 13, 14],
+  "duplicates": [12],
+  "expected_ranges_after": [[1, 14]],
+  "missing_ranges_after": [[4, 4], [6, 7]],
+  "merged_frames_after": [1, 2, 3, 5, 8, 9, 10, 11, 12, 13, 14],
+  "out_of_range_frames": [],
+  "state_fingerprint": "a3f1…（64 位十六进制 SHA-256）…e9",
+  "created_at": "2026-09-24T09:00:00.000Z"
+}
+```
+
+字段口径（与导入结果完全一致，只是描述“假如现在导入”的情形）：
+
+- `raw_frames`：**提交的原始帧列表**，保留原始顺序与批内重复（预检单持久化在
+  `batch_previews` 表，随 volume 保留）；
+- `added_frames`：相对**创建时**胶卷状态的新增帧（去重排序）；
+- `duplicates`：相对创建时状态的重复帧（批内重复 + 胶卷已有，只计一次，上例
+  帧 12 既跨批重复又批内重复，只列一次）；
+- `expected_ranges_after` / `missing_ranges_after` / `merged_frames_after` /
+  `out_of_range_frames`：**导入后**的预期范围、连续缺帧区间、胶卷全部帧号与
+  范围外帧；
+- `state_fingerprint`：创建时胶卷状态指纹（合并后的预期覆盖闭区间 + 实扫帧
+  集合的 SHA-256），确认时在同一写事务内复核。
+
+预检期间 `GET /rolls/R-001` 等所有查询的结果与创建前完全相同——**预检不落批次**。
+
+#### 2.2 确认预检单（执行导入）
+
+```bash
+curl -X POST http://localhost:8000/batch-previews/7c2b9f4d0a6e4f2a8d1c6b3e5f7a9012/confirm
+```
+
+服务在**同一个 `BEGIN IMMEDIATE` SQLite 写事务**内：①重新计算胶卷当前状态
+指纹并与预检单比对 → ②指纹一致才执行**与 `POST /batches` 完全一致的现有导入
+逻辑**（含内容幂等、`batch_id` 占用判定）→ ③把首次导入结果固化到预检单。
+首次确认返回 `201 Created` 与常规批次导入结果：
+
+```json
+{
+  "batch_id": "b-2026-002",
+  "roll_no": "R-001",
+  "repeated": false,
+  "added_frames": [11, 13, 14],
+  "duplicates": [12],
+  "merged_frames": [1, 2, 3, 5, 8, 9, 10, 11, 12, 13, 14],
+  "expected_ranges": [[1, 14]],
+  "missing_ranges": [[4, 4], [6, 7]],
+  "out_of_range_frames": [],
+  "created_at": null
+}
+```
+
+规则与异常：
+
+- **状态漂移保护（409）**：预检单创建后，只要该胶卷的**预期覆盖或实扫帧**发生
+  变化（期间有其他批次导入、补扫回执或批次撤销），确认即返回
+  `409 Conflict`，**指纹复核与导入在同一事务内完成，批次绝不落库**，预检单
+  仍保持未确认；档案员可重新创建预检单后再确认。
+- **重复确认回放首次结果（200）**：同一预检单再次确认不会重复导入，返回
+  `200 OK` 与首次导入结果（`"repeated": true`，`batch_id`、新增/重复帧、
+  导入后范围均与首次一致），即使首次导入的批次后来被撤销，回放内容也不变。
+- **未知预检单 → `404 Not Found`**。
+- **指纹一致但内容已被其他途径导入**：按现有幂等导入处理，返回 `200 OK`、
+  `"repeated": true` 与已存批次结果，不产生新批次。
+- **`batch_id` 冲突 → `409 Conflict`**（与直接提交 `/batches` 规则一致）。
+- 预检本身不占用 `batch_id`：创建预检单后、确认前，该 `batch_id` 仍可能被
+  `/batches` 或其他预检单的确认使用；是否冲突以确认那一刻为准。
+- 预检单不设有效期；无需确认的预检单可直接弃用（不影响任何业务数据）。
+
+### 3. 查询批次
 
 ```bash
 curl http://localhost:8000/batches/b-2026-001
 ```
 
-### 3. 撤销误导入批次
+### 4. 撤销误导入批次
 
 ```bash
 curl -i -X DELETE http://localhost:8000/batches/b-2026-001
@@ -139,7 +243,7 @@ curl -i -X DELETE http://localhost:8000/batches/b-2026-001
   或撤销的是该胶卷最后一批时不受此限制。1.2 起新导入的批次都保存原始帧列表（含批内重复，
   保序），可任意撤销。
 
-### 4. 查询胶卷完整状态
+### 5. 查询胶卷完整状态
 
 ```bash
 curl http://localhost:8000/rolls/R-001
@@ -148,13 +252,13 @@ curl http://localhost:8000/rolls/R-001
 返回合并后的预期范围、全部帧号、连续缺帧区间、范围外帧，以及每个批次的明细
 （各批次的原始帧、新增帧、重复帧）。
 
-### 5. 列出全部胶卷汇总
+### 6. 列出全部胶卷汇总
 
 ```bash
 curl http://localhost:8000/rolls
 ```
 
-### 6. 认领补扫任务
+### 7. 认领补扫任务
 
 ```bash
 curl -X POST http://localhost:8000/rolls/R-001/rescan-claims \
@@ -202,7 +306,7 @@ curl -X POST http://localhost:8000/rolls/R-001/rescan-claims \
 接着另一人再领（缺帧原为 `[4,7]`、`[11,11]`）：领到 `[7,7]`；第三个人领到 `[11,11]`；
 再领返回 `409`，直到有人释放任务或任务到期。
 
-### 7. 列出未到期的补扫任务
+### 8. 列出未到期的补扫任务
 
 ```bash
 curl http://localhost:8000/rolls/R-001/rescan-claims
@@ -212,7 +316,7 @@ curl http://localhost:8000/rolls/R-001/rescan-claims
 `frame_start`/`frame_end`、`frame_count`、创建与到期时间，以及该区间内仍缺失的
 `remaining_missing_ranges`；胶卷不存在返回 `404`，无任务时返回 `[]`。
 
-### 8. 释放补扫任务
+### 9. 释放补扫任务
 
 ```bash
 curl -i -X DELETE http://localhost:8000/rescan-claims/92825c49b6f14f4d8058cdd50d13a82b
@@ -221,7 +325,7 @@ curl -i -X DELETE http://localhost:8000/rescan-claims/92825c49b6f14f4d8058cdd50d
 成功返回 `204 No Content`，占用的帧段立即重新可被领取；
 任务不存在、**已释放**、已到期或**已结案**均返回 `404`（重复释放幂等地得到 404）。
 
-### 9. 提交补扫完成回执
+### 10. 提交补扫完成回执
 
 领取人补扫完成后，凭**认领 ID**提交回执，携带本次补扫的**批次号**与
 **实际扫到的非空帧列表**（原始列表，至少 1 个，批内重复会被识别为重复帧）：
@@ -279,9 +383,9 @@ curl -X POST http://localhost:8000/rescan-claims/92825c49b6f14f4d8058cdd50d13a82
   不会因此复活，让出的帧段可被正常认领。
 - `frames` 为空、`batch_id` 为空白 → `422`。
 
-### 10. 交付快照与差异对比
+### 11. 交付快照与差异对比
 
-#### 10.1 拍摄交付快照
+#### 11.1 拍摄交付快照
 
 ```bash
 curl -X POST http://localhost:8000/rolls/R-001/snapshots
@@ -306,7 +410,7 @@ curl -X POST http://localhost:8000/rolls/R-001/snapshots
 - 快照只新增、从不修改：此后的**批次导入、撤销、补扫认领与回执**都不会改变
   快照内容；快照与业务数据同在一个 SQLite 库（`roll_snapshots` 表），随 volume 保留。
 
-#### 10.2 查询当前相对快照的差异
+#### 11.2 查询当前相对快照的差异
 
 ```bash
 curl http://localhost:8000/rolls/R-001/snapshots/ca1f7600507e488d956d6cb5f58132c0/diff
@@ -339,7 +443,7 @@ curl http://localhost:8000/rolls/R-001/snapshots/ca1f7600507e488d956d6cb5f58132c
   差异继续按新内容计算（会同时出现新增与消失）。此时对该胶卷**新建**快照仍为 `404`。
 - 未知快照 ID、或快照归属的胶卷编号与 URL 中的 `roll_no` 不匹配 → `404`。
 
-### 11. 胶卷帧号扫描溯源
+### 12. 胶卷帧号扫描溯源
 
 供档案员追查某胶卷区间内**每个实际存在的帧**分别由哪些批次扫描：
 
@@ -411,7 +515,7 @@ curl 'http://localhost:8000/rolls/R-001/frame-provenance?start=0&end=12&limit=3'
   **`end < start`** → `422 Unprocessable Entity`
 - 胶卷不存在（尚未导入任何批次，或最后一批已被撤销）→ `404 Not Found`
 
-### 12. 批次采集质量审查
+### 13. 批次采集质量审查
 
 供档案员审查**单个扫描批次**的采集质量（只读接口，不修改批次或胶卷汇总，
 结果只针对该批次本身，与胶卷合并状态无关）：
@@ -472,7 +576,7 @@ curl http://localhost:8000/batches/b-2026-001/quality
   无法按原始顺序评估 → `409 Conflict`（与批次撤销的旧数据规则一致），
   数据不发生任何变化。
 
-### 13. 健康检查
+### 14. 健康检查
 
 ```bash
 curl http://localhost:8000/health
@@ -563,6 +667,22 @@ curl http://localhost:8000/health
       （预期内最长缺口 ≥ 10 帧）；响应同时给出本次使用的阈值。
     - 批次不存在返回 `404`；旧版批次缺少原始帧列表时按旧数据规则返回 `409`，
       数据不变。
+12. **批次导入预检与确认**（`POST /batch-previews`、
+    `POST /batch-previews/{preview_id}/confirm`）：
+    - 创建预检单的请求体与 `POST /batches` 完全相同；预检**只模拟、不落批次**，
+      返回相对**当前**胶卷状态的新增帧、重复帧（批内重复 + 胶卷已有，只计一次）、
+      导入后预期范围、缺帧区间、全部帧号与范围外帧。
+    - 预检单持久化在 `batch_previews` 表（启动时幂等建表，旧库自动补建），
+      保留**原始帧顺序**（含批内重复）与创建时**胶卷状态指纹**
+      （合并后的预期覆盖闭区间 + 实扫帧集合的 SHA-256）。
+    - 确认在**同一个 `BEGIN IMMEDIATE` 写事务**内完成：先复核指纹，状态不同
+      （期间有批次导入、撤销或补扫回执改变了预期覆盖或实扫帧）即整体 `409`
+      且**批次不落库**，预检单保持未确认；指纹一致才执行与 `/batches` 一致的
+      现有导入逻辑（含内容幂等与 `batch_id` 占用判定）。
+    - 首次确认成功返回导入结果（`201`，指纹一致但内容此前已被导入则按幂等
+      返回 `200`）；同一预检单再次确认**回放首次结果**（`200`，`repeated=true`），
+      不重复导入；未知预检单返回 `404`。
+    - 预检不占用 `batch_id`、不设有效期，弃用的预检单不影响任何业务数据。
 
 ## 本地非 Docker 运行（开发用）
 

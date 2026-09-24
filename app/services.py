@@ -22,6 +22,24 @@ def content_hash(roll_no: str, start: int, end: int, frames: list[int]) -> str:
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
+def roll_state_fingerprint(
+    expected: list[tuple[int, int]], frames: set[int]
+) -> str:
+    """胶卷当前状态指纹：合并后的预期覆盖闭区间 + 实扫帧集合的 SHA-256。
+
+    预检单创建时固化，确认时在同一写事务内复核；胶卷的任何批次导入或撤销
+    只要改变了预期覆盖或实扫帧，指纹即不同（批次明细变化而这两者不变时
+    预检结论仍有效，不视为状态漂移）。
+    """
+    payload = json.dumps(
+        {"expected": [list(x) for x in merge_intervals(expected)],
+         "frames": sorted(frames)},
+        separators=(",", ":"),
+        ensure_ascii=False,
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
 def merge_intervals(intervals: list[tuple[int, int]]) -> list[tuple[int, int]]:
     """合并重叠或相邻的闭区间，例如 [(1,5),(5,8)] -> [(1,8)]。"""
     if not intervals:
@@ -258,21 +276,43 @@ def list_rolls(conn: sqlite3.Connection) -> list[schemas.RollSummary]:
     return out
 
 
-def get_batch(conn: sqlite3.Connection, batch_id: str) -> schemas.BatchResult | None:
-    r = conn.execute("SELECT * FROM batches WHERE id = ?", (batch_id,)).fetchone()
-    if r is None:
-        return None
-    st = _state_from_db(conn, r["roll_no"])
+def _build_batch_result(
+    conn: sqlite3.Connection,
+    roll_no: str,
+    batch_id: str,
+    *,
+    repeated: bool,
+    added_frames: list[int],
+    duplicates: list[int],
+    created_at: str | None = None,
+) -> schemas.BatchResult:
+    """从当前胶卷状态组装批次导入/回放结果。"""
+    st = _state_from_db(conn, roll_no)
     return schemas.BatchResult(
-        batch_id=r["id"],
-        roll_no=r["roll_no"],
-        repeated=True,
-        added_frames=json.loads(r["frames_merged_json"]),
-        duplicates=json.loads(r["duplicates_json"]),
+        batch_id=batch_id,
+        roll_no=roll_no,
+        repeated=repeated,
+        added_frames=added_frames,
+        duplicates=duplicates,
         merged_frames=sorted(st["frames"]),
         expected_ranges=[list(x) for x in st["expected"]],
         missing_ranges=[list(x) for x in st["missing"]],
         out_of_range_frames=st["out_of_range"],
+        created_at=created_at,
+    )
+
+
+def get_batch(conn: sqlite3.Connection, batch_id: str) -> schemas.BatchResult | None:
+    r = conn.execute("SELECT * FROM batches WHERE id = ?", (batch_id,)).fetchone()
+    if r is None:
+        return None
+    return _build_batch_result(
+        conn,
+        r["roll_no"],
+        r["id"],
+        repeated=True,
+        added_frames=json.loads(r["frames_merged_json"]),
+        duplicates=json.loads(r["duplicates_json"]),
         created_at=r["created_at"],
     )
 
@@ -349,37 +389,56 @@ def _import_batch_tx(
     return batch_id, new_frames, duplicates
 
 
-def submit_batch(conn: sqlite3.Connection, data: schemas.BatchIn) -> tuple[schemas.BatchResult, int]:
-    """导入一个批次。返回 (结果, HTTP 状态码 201新建 / 200重复)。
+def _submit_batch_locked(
+    conn: sqlite3.Connection, data: schemas.BatchIn
+) -> tuple[schemas.BatchResult, int]:
+    """现有批次导入逻辑（调用方须已持有 BEGIN IMMEDIATE 写事务）。
 
-    幂等保证：(roll_no, 内容指纹) 唯一。相同内容重复导入不写任何数据。
+    返回 (结果, HTTP 状态码 201新建 / 200重复)。相同内容重复导入不写任何数据。
+    显式 batch_id 被不同内容占用时抛 BatchIdConflictError（由调用方回滚）。
+    预检确认复用本函数，从而与直接 POST /batches 走完全一致的导入路径。
     """
     frames = sorted(set(data.frames))
     digest = content_hash(
         data.roll_no, data.expected_start, data.expected_end, frames
     )
+    existing = conn.execute(
+        "SELECT id FROM batches WHERE roll_no = ? AND content_hash = ?",
+        (data.roll_no, digest),
+    ).fetchone()
+    if existing is not None:
+        result = get_batch(conn, existing["id"])
+        assert result is not None
+        return result, 200
 
+    batch_id = data.batch_id or f"auto-{uuid.uuid4().hex}"
+    batch_id, new_frames, duplicates = _import_batch_tx(
+        conn,
+        data.roll_no,
+        data.expected_start,
+        data.expected_end,
+        data.frames,
+        batch_id,
+    )
+    result = _build_batch_result(
+        conn,
+        data.roll_no,
+        batch_id,
+        repeated=False,
+        added_frames=new_frames,
+        duplicates=duplicates,
+    )
+    return result, 201
+
+
+def submit_batch(conn: sqlite3.Connection, data: schemas.BatchIn) -> tuple[schemas.BatchResult, int]:
+    """导入一个批次。返回 (结果, HTTP 状态码 201新建 / 200重复)。
+
+    幂等保证：(roll_no, 内容指纹) 唯一。相同内容重复导入不写任何数据。
+    """
     conn.execute("BEGIN IMMEDIATE")
     try:
-        existing = conn.execute(
-            "SELECT id FROM batches WHERE roll_no = ? AND content_hash = ?",
-            (data.roll_no, digest),
-        ).fetchone()
-        if existing is not None:
-            conn.execute("ROLLBACK")
-            result = get_batch(conn, existing["id"])
-            assert result is not None
-            return result, 200
-
-        batch_id = data.batch_id or f"auto-{uuid.uuid4().hex}"
-        batch_id, new_frames, duplicates = _import_batch_tx(
-            conn,
-            data.roll_no,
-            data.expected_start,
-            data.expected_end,
-            data.frames,
-            batch_id,
-        )
+        result, code = _submit_batch_locked(conn, data)
         conn.execute("COMMIT")
     except BatchIdConflictError:
         conn.execute("ROLLBACK")
@@ -387,20 +446,187 @@ def submit_batch(conn: sqlite3.Connection, data: schemas.BatchIn) -> tuple[schem
     except Exception:
         conn.execute("ROLLBACK")
         raise
+    return result, code
 
-    st = _state_from_db(conn, data.roll_no)
-    result = schemas.BatchResult(
-        batch_id=batch_id,
-        roll_no=data.roll_no,
-        repeated=False,
-        added_frames=new_frames,
-        duplicates=duplicates,
-        merged_frames=sorted(st["frames"]),
-        expected_ranges=[list(x) for x in st["expected"]],
-        missing_ranges=[list(x) for x in st["missing"]],
-        out_of_range_frames=st["out_of_range"],
+
+# ---------- 批次导入预检 ----------
+
+class PreviewNotFoundError(Exception):
+    def __init__(self, preview_id: str):
+        self.preview_id = preview_id
+        super().__init__(f"预检单不存在: {preview_id}")
+
+
+class PreviewStateChangedError(Exception):
+    """确认时胶卷状态指纹与预检单创建时不同，预检结论已失效。"""
+
+    def __init__(self, preview_id: str):
+        self.preview_id = preview_id
+        super().__init__(f"预检单创建后胶卷状态已变化，拒绝确认: {preview_id}")
+
+
+def _preview_out(r: sqlite3.Row) -> schemas.BatchPreviewOut:
+    return schemas.BatchPreviewOut(
+        preview_id=r["id"],
+        roll_no=r["roll_no"],
+        batch_id=r["batch_id"],
+        expected_start=r["expected_start"],
+        expected_end=r["expected_end"],
+        raw_frames=json.loads(r["raw_frames_json"]),
+        added_frames=json.loads(r["added_frames_json"]),
+        duplicates=json.loads(r["duplicates_json"]),
+        expected_ranges_after=json.loads(r["expected_ranges_json"]),
+        missing_ranges_after=json.loads(r["missing_ranges_json"]),
+        merged_frames_after=json.loads(r["merged_frames_json"]),
+        out_of_range_frames=json.loads(r["out_of_range_json"]),
+        state_fingerprint=r["state_fingerprint"],
+        created_at=r["created_at"],
     )
-    return result, 201
+
+
+def create_batch_preview(
+    conn: sqlite3.Connection, data: schemas.BatchIn
+) -> schemas.BatchPreviewOut:
+    """生成持久化预检单：提交与 /batches 相同的数据，但不写入批次。
+
+    在 BEGIN IMMEDIATE 写事务内读取创建瞬间的胶卷状态（与并发导入/撤销串行化），
+    按现有导入口径模拟一次导入：新增帧、重复帧（批内重复 + 胶卷已有，只计一次）、
+    导入后预期范围、缺帧区间、全部帧号与范围外帧；同时固化原始帧顺序与胶卷状态
+    指纹（预期覆盖 + 实扫帧）。预检单落库后立即提交，批次相关表不发生任何变化。
+    """
+    preview_id = uuid.uuid4().hex
+
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        st = _state_from_db(conn, data.roll_no)
+        existing_frames: set[int] = st["frames"]
+
+        frame_set = set(data.frames)
+        within_dup = _within_batch_duplicates(list(data.frames))
+        duplicates = sorted(within_dup | (frame_set & existing_frames))
+        new_frames = sorted(frame_set - existing_frames)
+
+        expected_after = merge_intervals(
+            st["expected"] + [(data.expected_start, data.expected_end)]
+        )
+        merged_after = existing_frames | frame_set
+        missing_after = missing_intervals(expected_after, merged_after)
+        out_of_range_after = out_of_range_frames(expected_after, merged_after)
+        fingerprint = roll_state_fingerprint(st["expected"], existing_frames)
+
+        frames_dedup = sorted(frame_set)
+        digest = content_hash(
+            data.roll_no, data.expected_start, data.expected_end, frames_dedup
+        )
+
+        conn.execute(
+            """INSERT INTO batch_previews
+                   (id, roll_no, expected_start, expected_end, raw_frames_json,
+                    batch_id, content_hash, state_fingerprint, added_frames_json,
+                    duplicates_json, expected_ranges_json, missing_ranges_json,
+                    merged_frames_json, out_of_range_json)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                preview_id,
+                data.roll_no,
+                data.expected_start,
+                data.expected_end,
+                json.dumps(list(data.frames)),
+                data.batch_id,
+                digest,
+                fingerprint,
+                json.dumps(new_frames),
+                json.dumps(duplicates),
+                json.dumps([list(x) for x in expected_after]),
+                json.dumps([list(x) for x in missing_after]),
+                json.dumps(sorted(merged_after)),
+                json.dumps(out_of_range_after),
+            ),
+        )
+        conn.execute("COMMIT")
+    except Exception:
+        conn.execute("ROLLBACK")
+        raise
+
+    r = conn.execute(
+        "SELECT * FROM batch_previews WHERE id = ?", (preview_id,)
+    ).fetchone()
+    assert r is not None
+    return _preview_out(r)
+
+
+def confirm_batch_preview(
+    conn: sqlite3.Connection, preview_id: str
+) -> tuple[schemas.BatchResult, int]:
+    """确认预检单：在同一 SQLite 写事务内复核指纹并执行现有导入逻辑。
+
+    - 预检单不存在 → PreviewNotFoundError（接口 404）；
+    - 已确认过：回放首次导入结果（200，repeated=true），不重复导入；
+    - 未确认但当前胶卷状态指纹与创建时不同 → PreviewStateChangedError
+      （接口 409），不落库任何批次数据，预检单保持未确认；
+    - 指纹一致：在同一 BEGIN IMMEDIATE 事务内复核后调用现有导入路径
+      （/batches 的幂等逻辑原样复用），并把首次结果持久化到预检单；
+      显式 batch_id 被其他内容占用仍按现有规则抛 BatchIdConflictError（409）。
+    """
+    preview_id = preview_id.strip()
+
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        prev = conn.execute(
+            "SELECT * FROM batch_previews WHERE id = ?", (preview_id,)
+        ).fetchone()
+        if prev is None:
+            raise PreviewNotFoundError(preview_id)
+
+        # 已确认：回放首次导入结果，不再次执行导入（重试语义：200）
+        if prev["confirmed_at"] is not None:
+            result = schemas.BatchResult.model_validate_json(prev["result_json"])
+            result.repeated = True
+            conn.execute("COMMIT")
+            return result, 200
+
+        # 同一写事务内复核创建时胶卷状态指纹；状态已变则拒绝，批次不落库
+        st = _state_from_db(conn, prev["roll_no"])
+        current_fp = roll_state_fingerprint(st["expected"], st["frames"])
+        if current_fp != prev["state_fingerprint"]:
+            raise PreviewStateChangedError(preview_id)
+
+        payload = schemas.BatchIn(
+            roll_no=prev["roll_no"],
+            expected_start=prev["expected_start"],
+            expected_end=prev["expected_end"],
+            frames=json.loads(prev["raw_frames_json"]),
+            batch_id=prev["batch_id"],
+        )
+        result, code = _submit_batch_locked(conn, payload)
+
+        conn.execute(
+            """UPDATE batch_previews
+                  SET confirmed_at = ?, result_batch_id = ?,
+                      result_json = ?, result_status_code = ?
+                WHERE id = ?""",
+            (
+                _now_iso(),
+                result.batch_id,
+                json.dumps(result.model_dump(), ensure_ascii=False),
+                code,
+                preview_id,
+            ),
+        )
+        conn.execute("COMMIT")
+    except PreviewNotFoundError:
+        conn.execute("ROLLBACK")
+        raise
+    except PreviewStateChangedError:
+        conn.execute("ROLLBACK")
+        raise
+    except BatchIdConflictError:
+        conn.execute("ROLLBACK")
+        raise
+    except Exception:
+        conn.execute("ROLLBACK")
+        raise
+    return result, code
 
 
 # ---------- 批次撤销 ----------

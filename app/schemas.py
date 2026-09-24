@@ -47,6 +47,41 @@ class BatchResult(BaseModel):
     created_at: str | None = None
 
 
+class BatchPreviewOut(BaseModel):
+    preview_id: str = Field(..., description="预检单 ID，用于确认导入")
+    roll_no: str
+    batch_id: str | None = Field(
+        ..., description="提交时携带的客户端批次号；留空为 null（确认时服务端自动生成）"
+    )
+    expected_start: int
+    expected_end: int
+    raw_frames: list[int] = Field(
+        ..., description="提交的原始帧列表（含批内重复、保留原始顺序）"
+    )
+    added_frames: list[int] = Field(
+        ..., description="相对创建时胶卷状态的新增帧（去重排序）；预检不写批次"
+    )
+    duplicates: list[int] = Field(
+        ..., description="相对创建时胶卷状态的重复帧（批内重复 + 胶卷已有），只计一次"
+    )
+    expected_ranges_after: list[list[int]] = Field(
+        ..., description="导入后预期范围（创建时预期覆盖并入本批范围，合并后）"
+    )
+    missing_ranges_after: list[list[int]] = Field(
+        ..., description="导入后预期范围内的连续缺帧区间"
+    )
+    merged_frames_after: list[int] = Field(
+        ..., description="导入后该胶卷的全部帧号（去重排序）"
+    )
+    out_of_range_frames: list[int] = Field(
+        ..., description="导入后落在全部预期范围之外的帧"
+    )
+    state_fingerprint: str = Field(
+        ..., description="创建时胶卷状态指纹（预期覆盖 + 实扫帧的 SHA-256），确认时复核"
+    )
+    created_at: str = Field(..., description="预检单创建时间（UTC ISO-8601）")
+
+
 class QualityAlertThresholds(BaseModel):
     duplicate_rate: float = Field(
         ..., description="批内重复率告警阈值（达到即触发 HIGH_DUPLICATE_RATE）"

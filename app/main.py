@@ -20,8 +20,8 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="胶片档案扫描整理 API",
-    description="按胶卷汇总扫描帧、去重、统计预期范围内的连续缺帧；批次导入幂等；支持误导入批次撤销、补扫任务认领与补扫完成回执；支持交付快照及相对快照的区间级差异对比；支持单批次采集质量审查（批内重复率、越界帧、预期内缺口及稳定告警代码）。",
-    version="1.6.0",
+    description="按胶卷汇总扫描帧、去重、统计预期范围内的连续缺帧；批次导入幂等；支持误导入批次撤销、补扫任务认领与补扫完成回执；支持交付快照及相对快照的区间级差异对比；支持单批次采集质量审查（批内重复率、越界帧、预期内缺口及稳定告警代码）；支持批次导入预检（持久化预检单、状态指纹复核与确认导入）。",
+    version="1.7.0",
     lifespan=lifespan,
 )
 
@@ -59,6 +59,61 @@ def get_batch(batch_id: str, conn: Connection = Depends(database.get_db)):
     result = services.get_batch(conn, batch_id)
     if result is None:
         raise HTTPException(status_code=404, detail="批次不存在")
+    return result
+
+
+@app.post(
+    "/batch-previews",
+    response_model=schemas.BatchPreviewOut,
+    status_code=status.HTTP_201_CREATED,
+    tags=["批次预检"],
+)
+def create_batch_preview(
+    payload: schemas.BatchIn,
+    conn: Connection = Depends(database.get_db),
+):
+    """批次导入预检：提交与 POST /batches 完全相同的数据，生成持久化预检单但不写入批次。
+
+    返回相对**当前胶卷状态**的新增帧、重复帧（批内重复 + 胶卷已有）、导入后
+    预期范围、缺帧区间、全部帧号与范围外帧；预检单保留原始帧顺序（含批内重复）
+    与创建时胶卷状态指纹。预检只读批次数据，不改变胶卷状态。
+    """
+    return services.create_batch_preview(conn, payload)
+
+
+@app.post(
+    "/batch-previews/{preview_id}/confirm",
+    response_model=schemas.BatchResult,
+    tags=["批次预检"],
+)
+def confirm_batch_preview(
+    preview_id: str,
+    response: Response,
+    conn: Connection = Depends(database.get_db),
+):
+    """确认预检单并执行导入。
+
+    在**同一个 SQLite 写事务**内先复核预检单创建时的胶卷状态指纹，再执行
+    与 POST /batches 一致的现有导入逻辑：当前状态与创建时不同则返回 `409`
+    且批次不落库（预检单保持未确认，可重新预检）；未知预检单返回 `404`。
+    确认成功返回导入结果（首次 `201`）；同一预检单再次确认直接返回首次结果
+    （`200`），不会重复导入。
+    """
+    try:
+        result, code = services.confirm_batch_preview(conn, preview_id.strip())
+    except services.PreviewNotFoundError:
+        raise HTTPException(status_code=404, detail="预检单不存在")
+    except services.PreviewStateChangedError:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="预检单创建后该胶卷状态已变化（有新批次导入或批次被撤销），预检结论失效，请重新预检后再确认",
+        )
+    except services.BatchIdConflictError as e:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"batch_id '{e.batch_id}' 已被其他内容占用，请更换后重试",
+        )
+    response.status_code = code
     return result
 
 
